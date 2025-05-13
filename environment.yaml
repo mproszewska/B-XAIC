@@ -1,0 +1,14 @@
+name: bxaic
+channels:
+  - defaults
+dependencies:
+  - cudatoolkit=11.8.0
+  - python=3.8.20
+  - pip:
+      - captum==0.7.0
+      - networkx==3.1
+      - numpy==1.21.0
+      - rdkit-pypi==2022.9.5
+      - torch==2.2.2
+      - torchvision==0.17.2
+      - torchaudio==2.2.2

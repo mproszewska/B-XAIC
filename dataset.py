@@ -22,13 +22,15 @@ SYMBOLS = ["C", "N", "O", "F", "Cl", "Br", "P", "S", "B", "I", "Unk"]
 
 class XAIMolecularDataset(InMemoryDataset):
 
-    molecular_data_path = "data/data.csv"
-    explanations_data_path = "data/explanations.sdf"
+
+
 
     def __init__(self, root, name, explanations=True) -> None:
         self.name = name
         super().__init__(root)
         assert self.name in TASKS
+        self.molecular_data_path = f"{root}/data.csv"
+        self.explanations_data_path = f"{root}/explanations.sdf"
 
         self._num_classes = 2
         property = {
@@ -40,7 +42,6 @@ class XAIMolecularDataset(InMemoryDataset):
             "rings-count": "rings",
             "rings-max": "largest_rings",
         }[self.name]
-
         df = pd.read_csv(self.molecular_data_path)
         self.splits = df[[f"split_{i}" for i in range(5)]]
 

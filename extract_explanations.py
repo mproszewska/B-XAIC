@@ -8,6 +8,9 @@ import numpy as np
 import pandas as pd
 import torch
 
+import torch.nn as nn
+import torch.nn.functional as F
+
 from torch.utils.data import Subset
 
 from torch_geometric.data import Data, Batch
@@ -46,6 +49,9 @@ EXPLAINERS = [
     "Deconvolution",
     "GuidedBackprop",
     "GraphMaskExplainer",
+    "PGMExplainer",
+    "FlowX",
+    "SubgraphX",
 ]
 
 
@@ -84,12 +90,13 @@ def args_parser():
         default=5,
         help="n_samples in ShapleyValueSampling",
     )
+    parser.add_argument("--perturb", type=str, default="zero", help="perturb")
     parser.add_argument("--save_all", type=bool, default=False)
     args = parser.parse_args()
     return args
 
 
-class ModelWrapper(torch.nn.Module):
+class ProtGNNWrapper(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -98,7 +105,13 @@ class ModelWrapper(torch.nn.Module):
         data = Data(x=x, edge_index=edge_index, batch=batch)
         return self.model(data)[0]
 
-
+class Wrap(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+    def forward(self, x, edge_index, batch=None):
+        return self.model(x, edge_index, batch=batch)
+        
 def main():
     args = args_parser()
     if args.node_mask_type == "none":
@@ -109,12 +122,13 @@ def main():
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+   
     loaded = torch.load(args.model_path, map_location=torch.device("cpu"), weights_only=False)
     loaded_args = loaded["args"]
 
-    dataset = XAIMolecularDataset("data", loaded_args["task"])
-    train_idxs, val_idxs, test_idxs = dataset.get_splits(loaded_args["split"])
+    dataset = XAIMolecularDataset("data", loaded_args["task"], explanations=True)
+    train_idxs, val_idxs, test_idxs = dataset.get_splits(loaded_args["split"], old=True)
+
     dataset_train, dataset_val, dataset_test = (
         Subset(dataset, train_idxs),
         Subset(dataset, val_idxs),
@@ -131,11 +145,11 @@ def main():
         for module in model.modules():
             if isinstance(module, MessagePassing):
                 if not hasattr(module, "in_channels"):
-                    print(module.__dict__)
                     channel_list = module.nn.channel_list
                     module.in_channels = channel_list[0]
                     module.out_channels = channel_list[-1]
-    except:
+    except Exception as e:
+        print(e)
         model_args.model_name = loaded["args"]["model_type"]
         model_args.readout = loaded["args"]["readout"]
         input_dim = dataset.num_node_features
@@ -147,12 +161,12 @@ def main():
                 layer.out_channels = layer.nn[0].out_features
         num_layers = len(protgnn.model.gnn_layers)
         protgnn.load_state_dict(loaded["state_dict"])
-        model = ModelWrapper(protgnn.model).to(device)
+        model = ProtGNNWrapper(protgnn.model).to(device)
     model.eval()
 
+    
     _, f1 = test(model, dataloader_test, device)
     assert np.abs(f1 - loaded["f1"]) < 0.01, f"f1 score: {f1:.2f} != {loaded['f1']:.2f}"
-
     model_config = dict(mode="multiclass_classification", task_level="graph", return_type="raw")
     if args.explainer_type == "PGExplainer":
         algorithm = PGExplainer(epochs=args.epochs, lr=args.lr).to(device)
@@ -162,6 +176,151 @@ def main():
         algorithm = CaptumExplainer("ShapleyValueSampling", n_samples=5)
     elif args.explainer_type == "GraphMaskExplainer":
         algorithm = GraphMaskExplainer(num_layers=num_layers, epochs=args.epochs, lr=args.lr)
+    elif args.explainer_type == "PGMExplainer":
+        assert args.node_mask_type == "object"
+        assert args.edge_mask_type is None
+        from torch_geometric.contrib.explain import PGMExplainer
+        model_config = dict(mode="multiclass_classification", task_level="graph", return_type="probs")
+        wrapper = Wrap(model)
+        explainer_config = dict(explanation_type=args.explanation_type, node_mask_type=args.node_mask_type, edge_mask_type=args.edge_mask_type)
+        explanations = []
+        for data in tqdm(dataset_test):
+            explainer = PGMExplainer(perturbation_mode=args.perturb,
+                                     num_samples=100,
+                                     max_subgraph_size=data.x.shape[0])  # , max_subgraph_size=1)
+            explainer.connect(model_config=model_config, explainer_config=explainer_config)
+
+            data = data.to(device)
+            explanation = explainer(wrapper, data.x, data.edge_index, target=data.y)
+            pred = wrapper(data.x, data.edge_index)
+            expl = Data(
+                x=data.x.detach().cpu(),
+                edge_index=data.edge_index.detach().cpu(),
+                y=data.y.detach().cpu(),
+                pred=pred.detach().cpu(),
+                node_mask=1 - explanation.pgm_stats,
+                edge_mask=None,
+                gt_node_mask=data.expl_node_mask.detach().cpu() if hasattr(data, "expl_node_mask") else None,
+                gt_edge_mask=(
+                    data.expl_edge_mask.detach().cpu() if hasattr(data, "expl_edge_mask") else None
+                ),
+            )
+            explanations.append(expl)
+
+        print(f"Finished with {len(explanations)}/{len(dataset_test)} explanations")
+        torch.save(
+            {
+                "args": vars(args),
+                "model_args": loaded_args,
+                "explanations": explanations,
+                "f1": loaded["f1"],
+            },
+            args.save_path,
+        )
+        print(f"Saved to {args.save_path}")
+        exit(0)
+    elif args.explainer_type == "FlowX":
+        assert args.batch_size == 1
+
+        from xgraph.models.explainers import FlowX, FlowX_minus, FlowX_plus, FlowX_shap
+        wrap = Wrap(model)
+
+        def remove_inf(x):
+            x = torch.where(x == float('-inf'), torch.tensor(-1.0), x)
+            x = torch.where(x == float('inf'), torch.tensor(1.0), x)
+            return x
+
+        explanations = list()
+        for data in tqdm(dataset_test, total=len(dataset_test)):
+            explainer = FlowX_shap(wrap, explain_graph=True, molecule=True)
+            data = data.to(device)
+
+            try:
+                walks, masks, related_preds, edge_scores = explainer(data.x, data.edge_index, batch=None)
+                self_loops_edge_scores = [e[-len(data.x):] for e in edge_scores]
+                edge_scores = [e[:-len(data.x)] for e in edge_scores]
+                masks = [remove_inf(m) for m in masks]
+                self_loops_masks = [m[-len(data.x):] for m in masks]
+                masks = [m[:-len(data.x)] for m in masks]
+                node_mask = sum(self_loops_edge_scores)
+                edge_mask = sum(edge_scores)
+            except Exception as e:
+                print(e)
+                torch.cuda.empty_cache()
+                node_mask = torch.zeros(len(data.x))
+                edge_mask = torch.zeros(len(data.edge_index[0]))
+
+            expl = Data(
+                x=data.x.detach().cpu(),
+                edge_index=data.edge_index.detach().cpu(),
+                y=data.y.detach().cpu(),
+                node_mask=node_mask.detach().cpu(),
+                edge_mask=edge_mask.detach().cpu(),
+                gt_node_mask=data.expl_node_mask.detach().cpu() if hasattr(data, "expl_node_mask") else None,
+                gt_edge_mask=(
+                    data.expl_edge_mask.detach().cpu() if hasattr(data, "expl_edge_mask") else None
+                ),
+            )
+            explanations.append(expl)
+
+        print(f"Finished with {len(explanations)}/{len(dataset_test)} explanations")
+
+        torch.save(
+            {
+                "args": vars(args),
+                "model_args": loaded_args,
+                "explanations": explanations,
+                "f1": loaded["f1"],
+            },
+            args.save_path,
+        )
+        print(f"Saved to {args.save_path}")
+        exit(0)
+
+    elif args.explainer_type == "SubgraphX":
+
+        from xgraph.models.explainers import SubgraphX
+        wrap = Wrap(model)
+        explanations = list()
+
+        explainer = SubgraphX(wrap, vis=False, verbose=False, rollout=10, min_atoms=5, save_dir=None)
+        for data in tqdm(dataset_test, total=len(dataset_test)):
+            data = data.to(device)
+            node_mask = torch.zeros(len(data.x), device=device)
+            for _ in range(args.trials):
+                masks, explanation_results, related_preds = explainer(data.x, data.edge_index)
+                expl = explanation_results[data.y.item()]
+                expl = torch.tensor(expl).long().to(device)
+
+                node_mask[expl] += 1.
+            node_mask = node_mask / args.trials
+
+            expl = Data(
+                x=data.x.detach().cpu(),
+                edge_index=data.edge_index.detach().cpu(),
+                y=data.y.detach().cpu(),
+                node_mask=node_mask.detach().cpu(),
+                edge_mask=None, #edge_mask.detach().cpu(),
+                gt_node_mask=data.expl_node_mask.detach().cpu() if hasattr(data, "expl_node_mask") else None,
+                gt_edge_mask=(
+                    data.expl_edge_mask.detach().cpu() if hasattr(data, "expl_edge_mask") else None
+                ),
+            )
+            explanations.append(expl)
+        print(f"Finished with {len(explanations)}/{len(dataset_test)} explanations")
+
+        torch.save(
+            {
+                "args": vars(args),
+                "model_args": loaded_args,
+                "explanations": explanations,
+                "f1": loaded["f1"],
+            },
+            args.save_path,
+        )
+        print(f"Saved to {args.save_path}")
+        exit(0)
+
     else:
         algorithm = CaptumExplainer(args.explainer_type)
 

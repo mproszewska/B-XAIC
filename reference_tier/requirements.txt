@@ -1,0 +1,11 @@
+# B-XAIC reference tier
+# Core (reference tier, compare, Gini NE) — any recent versions:
+numpy<2            # pinned <2 for torch 2.2.2 ABI compatibility
+pandas
+rdkit
+networkx
+shapiq
+scikit-learn       # optional; compare.py has a numpy AUROC fallback
+# On-model evaluation (run_onmodel.py) and reading explanations.pt:
+torch==2.2.2
+torch_geometric
